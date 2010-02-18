@@ -3,7 +3,7 @@
 # In the development environment your application's code is reloaded on
 # every request.  This slows down response time but is perfect for development
 # since you don't have to restart the webserver when you make code changes.
-config.cache_classes = false
+config.cache_classes = true
 
 # Log error messages when you accidentally call methods on nil.
 config.whiny_nils = true
@@ -15,3 +15,19 @@ config.action_controller.perform_caching             = false
 
 # Don't care if the mailer can't send
 config.action_mailer.raise_delivery_errors = false
+
+
+AUTH_NET_CONFIG = YAML.load_file("#{RAILS_ROOT}/config/authorize_net.yml")
+if AUTH_NET_CONFIG[RAILS_ENV]["auth_test"] == true
+  ActiveMerchant::Billing::Base.gateway_mode = :test
+end 
+
+#connecting to auth.net's test gateway can be really slow sometimes
+  CIMGATEWAY = ActiveMerchant::Billing::AuthorizeNetCimGateway.new(
+    :login => AUTH_NET_CONFIG[RAILS_ENV]["auth_login"],
+    :password => AUTH_NET_CONFIG[RAILS_ENV]["auth_password"],
+    :test => AUTH_NET_CONFIG[RAILS_ENV]["auth_test"]
+  )
+
+# for faster testing (but canned responses) you can uncomment this when you're pretty sure your auth.net code is working
+  # CIMGATEWAY = ActiveMerchant::Billing::AuthorizeNetCimGatewayTest.new
