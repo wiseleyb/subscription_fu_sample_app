@@ -1,0 +1,31 @@
+log/*.log
+log/*.pid
+tmp/**/*
+
+# Other useful tidbits
+.DS_Store
+config/database.yml
+config/authorize_net.yml
+config/environments/development.rb
+config/development.sphinx.conf
+config/test.sphinx.conf
+db/schema.rb
+db/sphinx/*
+index/*
+public/javascripts/cache/*
+public/stylesheets/cache/*
+public/system/*
+db/sphinx/*
+config/development.sphinx.conf
+
+# JLS!
+*.swp
+config/environments/production.rb
+
+# Uncomment if we someday add gems as plugins
+# doc/api
+# doc/app
+
+*.tmproj
+
+# config/initializers/site_keys.rb
