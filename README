@@ -1,12 +1,27 @@
+THIS IS VERY EARLY DEV WORK - not suitable for production yet - this will be under fairly active development in the month to come.
 
+What this is:  Hopefully this will become a useable plugin/engine based system for subscription systems.  
 
-1) Setup your config/database.yml
+What this is now:  A very rapidly hacked together subscription system that works with authorize.net's CIM subscription system.  Some of the code is based on a relatively complex subscription system I worked on a http://deucescracked.com  Part of it trying out some ideas of where we'd like that system to go and what we'd like it to support (specifically the queue based subscription system).
+
+What it does now:  It is basically a demo of one way you could work with CIM Profiles.  You can create/buy subscriptions and see some basic reporting on them.
+
+What it's definitely missing:  I haven't ported over unit tests yet.  I've commented out error handling to make it easier to debug.  This is very, very rough code.
+
+To use, experiment with:
+* in the same directory (like ~/dev) get the code:
+
+	git clone git://github.com/wiseleyb/subscription_fu.git
+	git clone git://github.com/wiseleyb/subscription_fu_sample_app.git
+	cd subscription_fu_sample_app
+	
+1) Set up your config/database.yml
 2) rake db:create
 3) rake db:migrate
 4) get an auth.net test account at  http://developer.authorize.net/testaccount/  
 5) copy authorize_net.yml.example and fill in your login/password.
 6) add authorize_net.yml to .gitignore
-7) look at development.rb - choose mocked object or auth.net's test gateway (can be slow but is a better way to test)
+7) look at development.rb - choose mocked auth.net object or auth.net's test gateway (can be slow but is a better way to test)
 
 
 GOTCHA's
