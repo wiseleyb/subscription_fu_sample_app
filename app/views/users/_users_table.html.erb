@@ -1,0 +1,12 @@
+<table>
+	<tr>
+		<th>Login</th>
+		<th>&nbsp;</th>
+	</tr>
+	<% User.all.each do |u| %>
+		<tr>
+			<td><%=u.login%></td>
+			<td><%=link_to "Show", user_path(u)%></td>
+		</tr>
+	<% end %>
+</table>

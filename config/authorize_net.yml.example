@@ -1,0 +1,6 @@
+# get a authorize.net test account here:  http://developer.authorize.net/testaccount/
+# don't put this in source control (add to .gitignore)
+development:
+  auth_login: abcdefg
+  auth_password: abcdefg
+  auth_test: true

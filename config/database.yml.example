@@ -1,0 +1,6 @@
+development:
+  adapter: mysql
+  database: subscription_fu_sample_app_dev
+  username: root
+  password:
+  socket: /private/tmp/mysql.sock

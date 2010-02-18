@@ -1,0 +1,16 @@
+<h2>User: <%=@user.login%></h2>
+
+<p><%=link_to "Buy a subscription", new_subscription_path(:user_id => @user.id) %></p>
+
+<h3>Subscriptions</h3>
+
+<%=render :partial => "/subscriptions/index", :locals => {:user_id => @user.id}%>
+
+
+<h3>Cim Profile and Payments</h3>
+
+<%=render :partial => "/cim_profiles/index", :locals => {:user_id => @user.id} %>
+
+<h3>Logs</h3>
+
+<%=render :partial => "/subscription_fu_logs/index", :locals => {:user_id => @user.id} %>
