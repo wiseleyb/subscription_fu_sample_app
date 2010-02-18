@@ -1,0 +1,2 @@
+module SubscriptionFuLogsHelper
+end

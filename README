@@ -1,0 +1,19 @@
+
+
+1) Setup your config/database.yml
+2) rake db:create
+3) rake db:migrate
+4) get an auth.net test account at  http://developer.authorize.net/testaccount/  
+5) copy authorize_net.yml.example and fill in your login/password.
+6) add authorize_net.yml to .gitignore
+7) look at development.rb - choose mocked object or auth.net's test gateway (can be slow but is a better way to test)
+
+
+GOTCHA's
+
+CSV - I don't have CSV in the CC form because, as far as I can tell, if you use it to setup a cim profile 
+you then have to send the CSV with every transaction that follows.  Auth.net's CIM system won't store the CSV
+value and it's against their terms of service to store it your self.  This kind of defeats the purpose of
+a recurring billing system (forcing the user to enter this data everytime since you'll likely be doing billing
+via cron)
+

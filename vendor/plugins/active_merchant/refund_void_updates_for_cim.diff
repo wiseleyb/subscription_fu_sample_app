@@ -1,0 +1,1794 @@
+From 608a17bfb4f4f1abc0da8a153f2842e26240d1cc Mon Sep 17 00:00:00 2001
+From: ben wiseley <wiseleyb@Mac-san.local>
+Date: Wed, 28 Oct 2009 16:32:01 -0700
+Subject: [PATCH] Adding :refund, :void and :prior_auth_capture to authorize_net_cim
+
+---
+ .../billing/gateways/authorize_net_cim.rb          |  141 ++++++++++++-
+ .../gateways/remote_authorize_net_cim_test.rb      |  165 +++++++++++++++
+ test/unit/gateways/authorize_net_cim_test.rb       |  210 +++++++++++++++++++-
+ 3 files changed, 504 insertions(+), 12 deletions(-)
+
+diff --git a/lib/active_merchant/billing/gateways/authorize_net_cim.rb b/lib/active_merchant/billing/gateways/authorize_net_cim.rb
+index 6eb6f3e..6be4f1f 100644
+--- a/lib/active_merchant/billing/gateways/authorize_net_cim.rb
++++ b/lib/active_merchant/billing/gateways/authorize_net_cim.rb
+@@ -54,7 +54,10 @@ module ActiveMerchant #:nodoc:
+       CIM_TRANSACTION_TYPES = {
+         :auth_capture => 'profileTransAuthCapture',
+         :auth_only => 'profileTransAuthOnly',
+-        :capture_only => 'profileTransCaptureOnly'
++        :capture_only => 'profileTransCaptureOnly',
++        :prior_auth_capture => 'profileTransPriorAuthCapture',
++        :refund => 'profileTransRefund',
++        :void => 'profileTransVoid'
+       }
+ 
+       CIM_VALIDATION_MODES = {
+@@ -309,14 +312,105 @@ module ActiveMerchant #:nodoc:
+       #
+       # ==== Transaction
+       #
+-      # * <tt>:type</tt> -- The type of transaction. Can be either <tt>:auth_only</tt>, <tt>:capture_only</tt>, or <tt>:auth_capture</tt>. (REQUIRED)
+-      # * <tt>:amount</tt> -- The amount for the tranaction. Formatted with a decimal. For example "4.95" (REQUIRED)
+-      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. (REQUIRED)
+-      # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to use in this transaction. (REQUIRED)
++      # * <tt>:type</tt> -- The type of transaction. Can be either <tt>:auth_only</tt>, <tt>:capture_only</tt>, <tt>:auth_capture</tt>, <tt>:prior_auth_capture</tt>, <tt>:refund</tt> or <tt>:void</tt>. (REQUIRED)
++      # * <tt>:amount</tt> -- The amount for the tranaction. Formatted with a decimal. For example "4.95" (CONDITIONAL)
++      #     - :type == :void (NOT USED)
++      #     - :type == (:refund, :auth_only, :capture_only, :auth_capture, :prior_auth_capture) (REQUIRED)
++      #
++      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. (CONDITIONAL)
++      #     - :type == (:void, :prior_auth_capture) (OPTIONAL)
++      #     - :type == :refund (CONDITIONAL - required if masked information is not being submitted [see below])
++      #     - :type == (:auth_only, :capture_only, :auth_capture) (REQUIRED)
++      #
++      # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to use in this transaction. (CONDITIONAL)
++      #     - :type == (:void, :prior_auth_capture) (OPTIONAL)
++      #     - :type == :refund (CONDITIONAL - required if masked information is not being submitted [see below])
++      #     - :type == (:auth_only, :capture_only, :auth_capture) (REQUIRED)
++      #
++      # * <tt>:trans_id</tt> -- The payment gateway assigned transaction ID of the original transaction (CONDITIONAL):
++      #     - :type = (:void, :refund, :prior_auth_capture) (REQUIRED)
++      #     - :type = (:auth_only, :capture_only, :auth_capture) (NOT USED)
++      #
++      # * <tt>customer_shipping_address_id</tt> -- Payment gateway assigned ID associated with the customer shipping address (CONDITIONAL)
++      #     - :type = (:void, :refund) (OPTIONAL)
++      #     - :type = (:auth_only, :capture_only, :auth_capture) (NOT USED)
++      #     - :type = (:prior_auth_capture) (OPTIONAL)
++      #
++      # ==== For :type == :refund only
++      # * <tt>:credit_card_number_masked</tt> -- (CONDITIONAL - requied for credit card refunds is :customer_profile_id AND :customer_payment_profile_id are missing)
++      # * <tt>:bank_routing_number_masked && :bank_account_number_masked</tt> -- (CONDITIONAL - requied for electronic check refunds is :customer_profile_id AND :customer_payment_profile_id are missing) (NOT ABLE TO TEST - I keep getting "ACH transactions are not accepted by this merchant." when trying to make a payment and, until that's possible I can't refund (wiseleyb@gmail.com))
+       def create_customer_profile_transaction(options)
+         requires!(options, :transaction)
+-        requires!(options[:transaction], :type, :amount, :customer_profile_id, :customer_payment_profile_id)
++        requires!(options[:transaction], :type)
++        case options[:transaction][:type]
++          when :void
++            requires!(options[:transaction], :trans_id)
++          when :refund
++            requires!(options[:transaction], :trans_id) &&
++              (
++                (options[:transaction][:customer_profile_id] && options[:transaction][:customer_payment_profile_id]) ||
++                options[:transaction][:credit_card_number_masked] ||
++                (options[:transaction][:bank_routing_number_masked] && options[:transaction][:bank_account_number_masked])
++              )
++          when :prior_auth_capture
++            requires!(options[:transaction], :amount, :trans_id)
++          else
++            requires!(options[:transaction], :amount, :customer_profile_id, :customer_payment_profile_id)
++        end
++        request = build_request(:create_customer_profile_transaction, options)
++        commit(:create_customer_profile_transaction, request)
++      end
++
++      # Creates a new payment transaction for refund from an existing customer profile
++      #
++      # This is what is used to refund a transaction you have stored in a Customer Profile.
++      #
++      # Returns a Response object that contains the result of the transaction in <tt>params['direct_response']</tt>
++      #
++      # ==== Options
++      #
++      # * <tt>:transaction</tt> -- A hash containing information on the transaction that is being requested. (REQUIRED)
++      #
++      # ==== Transaction
++      #
++      # * <tt>:amount</tt> -- The total amount to be refunded (REQUIRED)
++      #
++      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. (CONDITIONAL :customer_payment_profile_id must be included if used)
++      # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to use in this transaction. (CONDITIONAL :customer_profile_id must be included if used)
++      #
++      # * <tt>:credit_card_number_masked</tt> -- Four Xs follwed by the last four digits of the credit card (CONDITIONAL - used if customer_profile_id and customer_payment_profile_id aren't given)
++      #
++      # * <tt>:bank_routing_number_masked</tt> -- The last four gidits of the routing number to be refunded (CONDITIONAL - must be used with :bank_account_number_masked)
++      # * <tt>:bank_account_number_masked</tt> -- The last four digis of the bank account number to be refunded, Ex. XXXX1234 (CONDITIONAL - must be used with :bank_routing_number_masked)
++      def create_customer_profile_transaction_for_refund(options)
++        requires!(options, :transaction)
++        options[:transaction][:type] = :refund
++        requires!(options[:transaction], :trans_id)
++        requires!(options[:transaction], :amount)
++        request = build_request(:create_customer_profile_transaction, options)
++        commit(:create_customer_profile_transaction, request)
++      end
+ 
++      # Creates a new payment transaction for void from an existing customer profile
++      #
++      # This is what is used to void a transaction you have stored in a Customer Profile.
++      # 
++      # Returns a Response object that contains the result of the transaction in <tt>params['direct_response']</tt>
++      #
++      # ==== Options
++      #
++      # * <tt>:transaction</tt> -- A hash containing information on the transaction that is being requested. (REQUIRED)
++      #
++      # ==== Transaction
++      #
++      # * <tt>:trans_id</tt> -- The payment gateway assigned transaction id of the original transaction. (REQUIRED)
++      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. 
++      # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to use in this transaction.
++      # * <tt>:customer_shipping_address_id</tt> -- Payment gateway assigned ID associated with the customer shipping address.
++      def create_customer_profile_transaction_for_void(options)
++        requires!(options, :transaction)
++        options[:transaction][:type] = :void
++        requires!(options[:transaction], :trans_id)
+         request = build_request(:create_customer_profile_transaction, options)
+         commit(:create_customer_profile_transaction, request)
+       end
+@@ -502,10 +596,31 @@ module ActiveMerchant #:nodoc:
+         xml.tag!('transaction') do
+           xml.tag!(CIM_TRANSACTION_TYPES[transaction[:type]]) do
+             # The amount to be billed to the customer
+-            xml.tag!('amount', transaction[:amount])
+-            xml.tag!('customerProfileId', transaction[:customer_profile_id])
+-            xml.tag!('customerPaymentProfileId', transaction[:customer_payment_profile_id])
+-            xml.tag!('approvalCode', transaction[:approval_code]) if transaction[:type] == :capture_only
++            case transaction[:type]
++              when :void
++                tag_unless_blank(xml,'customerProfileId', transaction[:customer_profile_id])
++                tag_unless_blank(xml,'customerPaymentProfileId', transaction[:customer_payment_profile_id])
++                tag_unless_blank(xml,'customerShippingAddressId', transaction[:customer_shipping_address_id])
++                xml.tag!('transId', transaction[:trans_id])
++              when :refund
++                #TODO - add support for all the other options fields
++                xml.tag!('amount', transaction[:amount])
++                tag_unless_blank(xml, 'customerProfileId', transaction[:customer_profile_id])
++                tag_unless_blank(xml, 'customerPaymentProfileId', transaction[:customer_payment_profile_id])
++                tag_unless_blank(xml, 'customerShippingAddressId', transaction[:customer_shipping_address_id])
++                tag_unless_blank(xml, 'creditCardNumberMasked', transaction[:credit_card_number_masked])
++                tag_unless_blank(xml, 'bankRoutingNumberMasked', transaction[:bank_routing_number_masked])
++                tag_unless_blank(xml, 'bankAccountNumberMasked', transaction[:bank_account_number_masked])
++                xml.tag!('transId', transaction[:trans_id])
++              when :prior_auth_capture
++                xml.tag!('amount', transaction[:amount])
++                xml.tag!('transId', transaction[:trans_id])
++              else
++                xml.tag!('amount', transaction[:amount])
++                xml.tag!('customerProfileId', transaction[:customer_profile_id])
++                xml.tag!('customerPaymentProfileId', transaction[:customer_payment_profile_id])
++                xml.tag!('approvalCode', transaction[:approval_code]) if transaction[:type] == :capture_only
++            end
+             add_order(xml, transaction[:order]) if transaction[:order]
+           end
+         end
+@@ -647,7 +762,11 @@ module ActiveMerchant #:nodoc:
+         response.params['direct_response'] = parse_direct_response(response) if response.params['direct_response']
+         response
+       end
+-      
++
++      def tag_unless_blank(xml, tag_name, data)
++        xml.tag!(tag_name, data) unless data.blank? || data.nil?
++      end
++
+       def parse_direct_response(response)
+         direct_response = {'raw' => response.params['direct_response']}
+         direct_response_fields = response.params['direct_response'].split(',')
+diff --git a/test/remote/gateways/remote_authorize_net_cim_test.rb b/test/remote/gateways/remote_authorize_net_cim_test.rb
+index 3ab9c39..eb7eb52 100644
+--- a/test/remote/gateways/remote_authorize_net_cim_test.rb
++++ b/test/remote/gateways/remote_authorize_net_cim_test.rb
+@@ -457,4 +457,169 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_nil response.authorization
+     assert_equal "This transaction has been approved.", response.params['direct_response']['message']
+   end
++  
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_void_request
++    response = get_and_validate_auth_capture_response
++    
++    assert response = @gateway.create_customer_profile_transaction_for_void(
++      :transaction => {
++        :type => :void,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_request
++    response = get_and_validate_auth_capture_response
++    assert response = @gateway.create_customer_profile_transaction_for_refund(
++      :transaction => {
++        :type => :refund,
++        :trans_id => response.params['direct_response']['transaction_id'],
++        :amount => "1.00",
++        :credit_card_number_masked => @credit_card_masked
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_profile_ids_request
++    response = get_and_validate_auth_capture_response
++
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :refund,
++        :amount => 1,
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    # You can't test refunds in TEST MODE.  If you authorize or capture
++    # a transaction, and the transaction is not yet settled by the payment
++    # gateway, you cannot issue a refund. You get an error message
++    # saying "The referenced transaction does not meet the criteria for issuing a credit.".
++    assert_failure response
++    assert_equal 'The referenced transaction does not meet the criteria for issuing a credit.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_masked_credit_card_request
++    response = get_and_validate_auth_capture_response
++
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :refund,
++        :amount => 1,
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    # You can't test refunds in TEST MODE.  If you authorize or capture
++    # a transaction, and the transaction is not yet settled by the payment
++    # gateway, you cannot issue a refund. You get an error message
++    # saying "The referenced transaction does not meet the criteria for issuing a credit.".
++    assert_failure response
++    assert_equal 'The referenced transaction does not meet the criteria for issuing a credit.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_auth_only_and_then_prior_auth_capture_request
++    response = get_and_validate_auth_only_response
++
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :prior_auth_capture,
++        :trans_id => response.params['direct_response']['transaction_id'],
++        :amount => response.params['direct_response']['amount']
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++    return response
++  end
++
++  def get_and_validate_customer_payment_profile_request_with_bank_account_response
++    payment_profile = @options[:profile].delete(:payment_profiles)
++    assert response = @gateway.create_customer_profile(@options)
++    @customer_profile_id = response.authorization
++
++    assert response = @gateway.get_customer_profile(:customer_profile_id => @customer_profile_id)
++    assert_nil response.params['profile']['payment_profiles']
++
++    assert response = @gateway.create_customer_payment_profile(
++      :customer_profile_id => @customer_profile_id,
++      :payment_profile => {
++        :customer_type => 'individual', # Optional
++        :bill_to => @address,
++        :payment => {
++          :bank_account => {
++            :account_type => :checking,
++            :name_on_account => 'John Doe',
++            :echeck_type => :ccd,
++            :bank_name => 'Bank of America',
++            :routing_number => '123456789',
++            :account_number => '12345678'
++          }
++        },
++        :drivers_license => {
++          :state => 'MD',
++          :number => '12345',
++          :date_of_birth => '1981-3-31'
++        },
++        :tax_id => '123456789'
++      }
++    )
++
++    assert response.test?
++    assert_success response
++    assert_nil response.authorization
++    assert @customer_payment_profile_id = response.params['customer_payment_profile_id']
++    assert @customer_payment_profile_id =~ /\d+/, "The customerPaymentProfileId should be numeric. It was #{@customer_payment_profile_id}"
++    return response
++  end
++
++  def get_and_validate_auth_capture_response
++    assert response = @gateway.create_customer_profile(@options)
++    @customer_profile_id = response.authorization
++  
++    assert response = @gateway.get_customer_profile(:customer_profile_id => @customer_profile_id)
++    @customer_payment_profile_id = response.params['profile']['payment_profiles']['customer_payment_profile_id']
++  
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :type => :auth_capture,
++        :order => {
++          :invoice_number => '1234',
++          :description => 'Test Order Description',
++          :purchase_order_number => '4321'
++        },
++        :amount => @amount
++      }
++    )
++  
++    assert response.test?
++    assert_success response
++    assert_nil response.authorization
++    assert_equal "This transaction has been approved.", response.params['direct_response']['message']
++    assert response.params['direct_response']['approval_code'] =~ /\w{6}/
++    assert_equal "auth_capture", response.params['direct_response']['transaction_type']
++    assert_equal "100.00", response.params['direct_response']['amount']
++    assert_equal response.params['direct_response']['invoice_number'], '1234'
++    assert_equal response.params['direct_response']['order_description'], 'Test Order Description'
++    assert_equal response.params['direct_response']['purchase_order_number'], '4321'
++    return response
++  end
++  
+ end
+\ No newline at end of file
+diff --git a/test/unit/gateways/authorize_net_cim_test.rb b/test/unit/gateways/authorize_net_cim_test.rb
+index 911e33a..69ec147 100644
+--- a/test/unit/gateways/authorize_net_cim_test.rb
++++ b/test/unit/gateways/authorize_net_cim_test.rb
+@@ -325,7 +325,190 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
+   end
+ 
++  def test_should_create_customer_profile_transaction_for_void_request
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
++
++    assert response = @gateway.create_customer_profile_transaction_for_void(
++      :transaction => {
++        :trans_id => 1
++        }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_for_refund_request
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:refund))
++
++    assert response = @gateway.create_customer_profile_transaction_for_refund(
++      :transaction => {
++        :trans_id => 1,
++        :amount => "1.00",
++        :credit_card_number_masked => "XXXX1234"
++        }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_void_request
++    response = get_and_validate_auth_capture_response
++    
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :void,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++    return response
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_profile_ids_request
++    response = get_and_validate_auth_capture_response
++    
++    @gateway.expects(:ssl_post).returns(unsuccessful_create_customer_profile_transaction_response(:refund))
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :refund,
++        :amount => 1,
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    # You can't test refunds in TEST MODE.  If you authorize or capture a transaction, and the transaction is not yet settled by the payment gateway, you cannot issue a refund. You get an error message saying "The referenced transaction does not meet the criteria for issuing a credit.".
++    # more on this http://help.ablecommerce.com/mergedProjects/ablecommerce7/orders/payments/entering_payments.htm and
++    # http://www.modernbill.com/support/manual/old/v4/adminhelp/english/Configuration/Payment_Settings/Gateway_API/AuthorizeNet/Module_Authorize.net.htm
++    assert_failure response
++    assert_equal 'The referenced transaction does not meet the criteria for issuing a credit.', response.params['direct_response']['message']
++    return response
++  end
++
++  def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_masked_credit_card_request
++    response = get_and_validate_auth_capture_response
++    
++    @gateway.expects(:ssl_post).returns(unsuccessful_create_customer_profile_transaction_response(:refund))
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :type => :refund,
++        :amount => 1,
++        
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :trans_id => response.params['direct_response']['transaction_id']
++      }
++    )
++    assert_instance_of Response, response
++    # You can't test refunds in TEST MODE.  If you authorize or capture a transaction, and the transaction is not yet settled by the payment gateway, you cannot issue a refund. You get an error message saying "The referenced transaction does not meet the criteria for issuing a credit.".
++    # more on this http://help.ablecommerce.com/mergedProjects/ablecommerce7/orders/payments/entering_payments.htm and
++    # http://www.modernbill.com/support/manual/old/v4/adminhelp/english/Configuration/Payment_Settings/Gateway_API/AuthorizeNet/Module_Authorize.net.htm
++    assert_failure response
++    assert_equal 'The referenced transaction does not meet the criteria for issuing a credit.', response.params['direct_response']['message']
++    return response
++  end
++
++  # TODO - implement this
++  # def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_masked_electronic_checking_info_request
++  #   response = get_and_validate_auth_capture_response
++  #   
++  #   @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
++  #   assert response = @gateway.create_customer_profile_transaction(
++  #     :transaction => {
++  #       :type => :void,
++  #       :trans_id => response.params['direct_response']['transaction_id']
++  #     }
++  #   )
++  #   assert_instance_of Response, response
++  #   assert_success response
++  #   assert_nil response.authorization
++  #   assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  #   return response
++  # end
++
++  def test_should_create_customer_profile_transaction_for_void_request
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
++
++    assert response = @gateway.create_customer_profile_transaction_for_void(
++      :transaction => {
++        :trans_id => 1
++        }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
++  def test_should_create_customer_profile_transaction_for_refund_request
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:refund))
++
++    assert response = @gateway.create_customer_profile_transaction_for_refund(
++      :transaction => {
++        :trans_id => 1,
++        :amount => "1.00",
++        :credit_card_number_masked => "XXXX1234"
++        }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++  end
++
+   private
++
++  def get_auth_only_response
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:auth_only))
++
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :customer_profile_id => @customer_profile_id, 
++        :customer_payment_profile_id => @customer_payment_profile_id, 
++        :type => :auth_only, 
++        :amount => @amount
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++    assert_equal 'auth_only', response.params['direct_response']['transaction_type']
++    assert_equal 'Gw4NGI', approval_code = response.params['direct_response']['approval_code']
++    return response
++  end
++
++  def get_and_validate_auth_capture_response
++    @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:auth_capture))
++
++    assert response = @gateway.create_customer_profile_transaction(
++      :transaction => {
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :type => :auth_capture,
++        :order => {
++          :invoice_number => '1234',
++          :description => 'Test Order Description',
++          :purchase_order_number => '4321'
++        },
++        :amount => @amount
++      }
++    )
++    assert_instance_of Response, response
++    assert_success response
++    assert_nil response.authorization
++    assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
++    return response
++  end
+   
+   def successful_create_customer_profile_response
+     <<-XML
+@@ -630,7 +813,13 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+   SUCCESSFUL_DIRECT_RESPONSE = {
+     :auth_only => '1,1,1,This transaction has been approved.,Gw4NGI,Y,508223659,,,100.00,CC,auth_only,Up to 20 chars,,,,,,,,,,,Up to 255 Characters,,,,,,,,,,,,,,6E5334C13C78EA078173565FD67318E4,,2,,,,,,,,,,,,,,,,,,,,,,,,,,,,',
+     :capture_only => '1,1,1,This transaction has been approved.,,Y,508223660,,,100.00,CC,capture_only,Up to 20 chars,,,,,,,,,,,Up to 255 Characters,,,,,,,,,,,,,,6E5334C13C78EA078173565FD67318E4,,2,,,,,,,,,,,,,,,,,,,,,,,,,,,,',
+-    :auth_capture => '1,1,1,This transaction has been approved.,d1GENk,Y,508223661,32968c18334f16525227,Store purchase,1.00,CC,auth_capture,,Longbob,Longsen,,,,,,,,,,,,,,,,,,,,,,,269862C030129C1173727CC10B1935ED,P,2,,,,,,,,,,,,,,,,,,,,,,,,,,,,'
++    :auth_capture => '1,1,1,This transaction has been approved.,d1GENk,Y,508223661,32968c18334f16525227,Store purchase,1.00,CC,auth_capture,,Longbob,Longsen,,,,,,,,,,,,,,,,,,,,,,,269862C030129C1173727CC10B1935ED,P,2,,,,,,,,,,,,,,,,,,,,,,,,,,,,',
++    :void => '1,1,1,This transaction has been approved.,nnCMEx,P,2149222068,1245879759,,0.00,CC,void,1245879759,,,,,,,K1C2N6,,,,,,,,,,,,,,,,,,F240D65BB27ADCB8C80410B92342B22C,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,',
++    :refund => '1,1,1,This transaction has been approved.,nnCMEx,P,2149222068,1245879759,,0.00,CC,refund,1245879759,,,,,,,K1C2N6,,,,,,,,,,,,,,,,,,F240D65BB27ADCB8C80410B92342B22C,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,',
++    :prior_auth_capture => '1,1,1,This transaction has been approved.,VR0lrD,P,2149227870,1245958544,,1.00,CC,prior_auth_capture,1245958544,,,,,,,K1C2N6,,,,,,,,,,,,,,,,,,0B8BFE0A0DE6FDB69740ED20F79D04B0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,'
++  }
++  UNSUCCESSUL_DIRECT_RESPONSE = {
++    :refund => '3,2,54,The referenced transaction does not meet the criteria for issuing a credit.,,P,0,,,1.00,CC,credit,1245952682,,,Widgets Inc,1245952682 My Street,Ottawa,ON,K1C2N6,CA,,,bob1245952682@email.com,,,,,,,,,,,,,,207BCBBF78E85CF174C87AE286B472D2,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,447250,406104'
+   }
+ 
+   def successful_create_customer_profile_transaction_response(transaction_type)
+@@ -672,5 +861,24 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+       </validateCustomerPaymentProfileResponse>
+     XML
+   end
++
++  def unsuccessful_create_customer_profile_transaction_response(transaction_type)
++    <<-XML
++      <?xml version="1.0" encoding="utf-8"?>
++      <createCustomerProfileTransactionResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <messages>
++          <resultCode>Error</resultCode>
++          <message>
++            <code>E00027</code>
++            <text>The transaction was unsuccessful.</text>
++          </message>
++        </messages>
++        <directResponse>#{UNSUCCESSUL_DIRECT_RESPONSE[transaction_type]}</directResponse>
++      </createCustomerProfileTransactionResponse>
++    XML
++  end
+   
+ end
+-- 
+1.6.0.4
+
+
+From faf8d0302756584ac66cd1e0df1eb9d902a2e288 Mon Sep 17 00:00:00 2001
+From: ben wiseley <wiseleyb@Mac-san.local>
+Date: Wed, 28 Oct 2009 18:14:33 -0700
+Subject: [PATCH] removing trailing white space
+
+---
+ .../billing/gateways/authorize_net_cim.rb          |  150 ++++----
+ .../gateways/remote_authorize_net_cim_test.rb      |   24 +-
+ test/unit/gateways/authorize_net_cim_test.rb       |  410 ++++++++++----------
+ 3 files changed, 292 insertions(+), 292 deletions(-)
+
+diff --git a/lib/active_merchant/billing/gateways/authorize_net_cim.rb b/lib/active_merchant/billing/gateways/authorize_net_cim.rb
+index 6be4f1f..08e1b59 100644
+--- a/lib/active_merchant/billing/gateways/authorize_net_cim.rb
++++ b/lib/active_merchant/billing/gateways/authorize_net_cim.rb
+@@ -1,23 +1,23 @@
+ module ActiveMerchant #:nodoc:
+   module Billing #:nodoc:
+     # ==== Customer Information Manager (CIM)
+-    # 
++    #
+     # The Authorize.Net Customer Information Manager (CIM) is an optional additional service that allows you to store sensitive payment information on
+-    # Authorize.Net's servers, simplifying payments for returning customers and recurring transactions. It can also help with Payment Card Industry (PCI) 
++    # Authorize.Net's servers, simplifying payments for returning customers and recurring transactions. It can also help with Payment Card Industry (PCI)
+     # Data Security Standard compliance, since customer data is no longer stored locally.
+-    # 
++    #
+     # To use the AuthorizeNetCimGateway CIM must be enabled for your account.
+-    # 
++    #
+     # Information about CIM is available on the {Authorize.Net website}[http://www.authorize.net/solutions/merchantsolutions/merchantservices/cim/].
+     # Information about the CIM API is available at the {Authorize.Net Integration Center}[http://developer.authorize.net/]
+-    # 
++    #
+     # ==== Login and Password
+-    # 
+-    # The login and password are not the username and password you use to 
+-    # login to the Authorize.Net Merchant Interface. Instead, you will 
+-    # use the API Login ID as the login and Transaction Key as the 
++    #
++    # The login and password are not the username and password you use to
++    # login to the Authorize.Net Merchant Interface. Instead, you will
++    # use the API Login ID as the login and Transaction Key as the
+     # password.
+-    # 
++    #
+     # ==== How to Get Your API Login ID and Transaction Key
+     #
+     # 1. Log into the Merchant Interface
+@@ -26,12 +26,12 @@ module ActiveMerchant #:nodoc:
+     # 4. Type in the answer to the secret question configured on setup
+     # 5. Click Submit
+     class AuthorizeNetCimGateway < Gateway
+-    
++
+       class_inheritable_accessor :test_url, :live_url
+ 
+       self.test_url = 'https://apitest.authorize.net/xml/v1/request.api'
+       self.live_url = 'https://api.authorize.net/xml/v1/request.api'
+-      
++
+       AUTHORIZE_NET_CIM_NAMESPACE = 'AnetApi/xml/v1/schema/AnetApiSchema.xsd'
+ 
+       CIM_ACTIONS = {
+@@ -50,7 +50,7 @@ module ActiveMerchant #:nodoc:
+         :create_customer_profile_transaction => 'createCustomerProfileTransaction',
+         :validate_customer_payment_profile => 'validateCustomerPaymentProfile'
+       }
+-      
++
+       CIM_TRANSACTION_TYPES = {
+         :auth_capture => 'profileTransAuthCapture',
+         :auth_only => 'profileTransAuthOnly',
+@@ -65,23 +65,23 @@ module ActiveMerchant #:nodoc:
+         :test => 'testMode',
+         :live => 'liveMode'
+       }
+-      
++
+       BANK_ACCOUNT_TYPES = {
+         :checking => 'checking',
+         :savings => 'savings',
+         :business_checking => 'businessChecking'
+       }
+-      
++
+       ECHECK_TYPES = {
+         :ccd => 'CCD',
+         :ppd => 'PPD'
+       }
+-      
++
+       self.homepage_url = 'http://www.authorize.net/'
+       self.display_name = 'Authorize.Net CIM'
+       self.supported_countries = ['US']
+       self.supported_cardtypes = [:visa, :master, :american_express, :discover]
+-    
++
+       # Creates a new AuthorizeNetCimGateway
+       #
+       # The gateway requires that a valid API Login ID and Transaction Key be passed
+@@ -91,7 +91,7 @@ module ActiveMerchant #:nodoc:
+       #
+       # * <tt>:login</tt> -- The Authorize.Net API Login ID (REQUIRED)
+       # * <tt>:password</tt> -- The Authorize.Net Transaction Key. (REQUIRED)
+-      # * <tt>:test</tt> -- +true+ or +false+. If true, perform transactions against the test server. 
++      # * <tt>:test</tt> -- +true+ or +false+. If true, perform transactions against the test server.
+       #   Otherwise, perform transactions against the production server.
+       def initialize(options = {})
+         requires!(options, :login, :password)
+@@ -101,9 +101,9 @@ module ActiveMerchant #:nodoc:
+ 
+       # Creates a new customer profile along with any customer payment profiles and customer shipping addresses
+       # for the customer profile.
+-      # 
+-      # Returns a Response with the Customer Profile ID of the new customer profile in the authorization field. 
+-      # It is *CRITICAL* that you save this ID. There is no way to retrieve this through the API. You will not 
++      #
++      # Returns a Response with the Customer Profile ID of the new customer profile in the authorization field.
++      # It is *CRITICAL* that you save this ID. There is no way to retrieve this through the API. You will not
+       # be able to create another Customer Profile with the same information.
+       #
+       # ==== Options
+@@ -129,7 +129,7 @@ module ActiveMerchant #:nodoc:
+         requires!(options, :customer_profile_id)
+         requires!(options, :payment_profile)
+         requires!(options[:payment_profile], :payment)
+-        
++
+         request = build_request(:create_customer_payment_profile, options)
+         commit(:create_customer_payment_profile, request)
+       end
+@@ -143,7 +143,7 @@ module ActiveMerchant #:nodoc:
+       def create_customer_shipping_address(options)
+         requires!(options, :customer_profile_id)
+         requires!(options, :address)
+-        
++
+         request = build_request(:create_customer_shipping_address, options)
+         commit(:create_customer_shipping_address, request)
+       end
+@@ -204,9 +204,9 @@ module ActiveMerchant #:nodoc:
+ 
+       # Retrieve a customer payment profile for an existing customer profile.
+       #
+-      # Returns a Response whose params hash contains all the payment profile information. Sensitive information such as credit card 
++      # Returns a Response whose params hash contains all the payment profile information. Sensitive information such as credit card
+       # numbers will be masked.
+-      # 
++      #
+       # ==== Options
+       #
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer with the payment profile to be retrieved. (REQUIRED)
+@@ -221,8 +221,8 @@ module ActiveMerchant #:nodoc:
+ 
+       # Retrieve a customer shipping address for an existing customer profile.
+       #
+-      # Returns a Response whose params hash contains all the shipping address information. 
+-      # 
++      # Returns a Response whose params hash contains all the shipping address information.
++      #
+       # ==== Options
+       #
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer with the payment profile to be retrieved. (REQUIRED)
+@@ -235,16 +235,16 @@ module ActiveMerchant #:nodoc:
+         commit(:get_customer_shipping_address, request)
+       end
+ 
+-      # Updates an existing customer profile. 
+-      # 
+-      # Warning: if you do not provide a parameter in the <tt>:payment_profile</tt> hash, it is automatically set to nil at 
+-      # Authorize.Net. You will most likely want to first get the profile hash using get_customer_profile and then only change the 
++      # Updates an existing customer profile.
++      #
++      # Warning: if you do not provide a parameter in the <tt>:payment_profile</tt> hash, it is automatically set to nil at
++      # Authorize.Net. You will most likely want to first get the profile hash using get_customer_profile and then only change the
+       # elements you wish to change.
+       #
+       # ==== Options
+       #
+       # * <tt>:profile</tt> -- A hash containing the values the Customer Profile should be updated to. (REQUIRED)
+-      # 
++      #
+       # ==== Profile
+       #
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer profile to update. (REQUIRED)
+@@ -257,8 +257,8 @@ module ActiveMerchant #:nodoc:
+       end
+ 
+       # Updates a customer payment profile for an existing customer profile.
+-      # 
+-      # Warning: if you do not provide a parameter in the <tt>:payment_profile</tt> hash, it is automatically set to nil at 
++      #
++      # Warning: if you do not provide a parameter in the <tt>:payment_profile</tt> hash, it is automatically set to nil at
+       # Authorize.Net. You will most likely want to first get the profile hash using get_customer_payment_profile and then only
+       # change the elements you wish to change.
+       #
+@@ -266,7 +266,7 @@ module ActiveMerchant #:nodoc:
+       #
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer with the payment profile to be updated. (REQUIRED)
+       # * <tt>:payment_profile</tt> -- A hash containing the values the Customer Payment Profile should be updated to. (REQUIRED)
+-      # 
++      #
+       # ==== Payment Profile
+       #
+       # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to update. (REQUIRED)
+@@ -279,8 +279,8 @@ module ActiveMerchant #:nodoc:
+       end
+ 
+       # Updates a customer shipping address for an existing customer profile.
+-      # 
+-      # Warning: if you do not provide a parameter in the <tt>:address</tt> hash, it is automatically set to nil at 
++      #
++      # Warning: if you do not provide a parameter in the <tt>:address</tt> hash, it is automatically set to nil at
+       # Authorize.Net. You will most likely want to first get the profile hash using get_customer_shipping_address and then only
+       # change the elements you wish to change.
+       #
+@@ -288,7 +288,7 @@ module ActiveMerchant #:nodoc:
+       #
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer with the payment profile to be updated. (REQUIRED)
+       # * <tt>:address</tt> -- A hash containing the values the Customer Shipping Address should be updated to. (REQUIRED)
+-      # 
++      #
+       # ==== Address
+       #
+       # * <tt>:customer_address_id</tt> -- The Customer Address ID of the Customer Payment Profile to update. (REQUIRED)
+@@ -303,7 +303,7 @@ module ActiveMerchant #:nodoc:
+       # Creates a new payment transaction from an existing customer profile
+       #
+       # This is what is used to charge a customer whose information you have stored in a Customer Profile.
+-      # 
++      #
+       # Returns a Response object that contains the result of the transaction in <tt>params['direct_response']</tt>
+       #
+       # ==== Options
+@@ -394,7 +394,7 @@ module ActiveMerchant #:nodoc:
+       # Creates a new payment transaction for void from an existing customer profile
+       #
+       # This is what is used to void a transaction you have stored in a Customer Profile.
+-      # 
++      #
+       # Returns a Response object that contains the result of the transaction in <tt>params['direct_response']</tt>
+       #
+       # ==== Options
+@@ -404,7 +404,7 @@ module ActiveMerchant #:nodoc:
+       # ==== Transaction
+       #
+       # * <tt>:trans_id</tt> -- The payment gateway assigned transaction id of the original transaction. (REQUIRED)
+-      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. 
++      # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction.
+       # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to use in this transaction.
+       # * <tt>:customer_shipping_address_id</tt> -- Payment gateway assigned ID associated with the customer shipping address.
+       def create_customer_profile_transaction_for_void(options)
+@@ -424,7 +424,7 @@ module ActiveMerchant #:nodoc:
+       # * <tt>:customer_profile_id</tt> -- The Customer Profile ID of the customer to use in this transaction. (REQUIRED)
+       # * <tt>:customer_payment_profile_id</tt> -- The Customer Payment Profile ID of the Customer Payment Profile to be verified. (REQUIRED)
+       # * <tt>:customer_address_id</tt> -- The Customer Address ID of the Customer Shipping Address to be verified.
+-      # * <tt>:validation_mode</tt> -- <tt>:live</tt> or <tt>:test</tt> In Test Mode, only field validation is performed. 
++      # * <tt>:validation_mode</tt> -- <tt>:live</tt> or <tt>:test</tt> In Test Mode, only field validation is performed.
+       #   In Live Mode, a transaction is generated and submitted to the processor with the amount of $0.01. If successful, the transaction is immediately voided. (REQUIRED)
+       def validate_customer_payment_profile(options)
+         requires!(options, :customer_profile_id, :customer_payment_profile_id, :validation_mode)
+@@ -438,7 +438,7 @@ module ActiveMerchant #:nodoc:
+       def expdate(credit_card)
+         sprintf('%04d-%02d', credit_card.year, credit_card.month)
+       end
+-      
++
+       def build_request(action, options = {})
+         unless CIM_ACTIONS.include?(action)
+           raise StandardError, "Invalid Customer Information Manager Action: #{action}"
+@@ -461,7 +461,7 @@ module ActiveMerchant #:nodoc:
+           xml.tag!('transactionKey', @options[:password])
+         end
+       end
+-      
++
+       def build_create_customer_profile_request(xml, options)
+         add_profile(xml, options[:profile])
+ 
+@@ -470,23 +470,23 @@ module ActiveMerchant #:nodoc:
+ 
+       def build_create_customer_payment_profile_request(xml, options)
+         xml.tag!('customerProfileId', options[:customer_profile_id])
+-        
++
+         xml.tag!('paymentProfile') do
+           add_payment_profile(xml, options[:payment_profile])
+         end
+-        
++
+         xml.tag!('validationMode', CIM_VALIDATION_MODES[options[:validation_mode]]) if options[:validation_mode]
+ 
+         xml.target!
+       end
+-      
++
+       def build_create_customer_shipping_address_request(xml, options)
+         xml.tag!('customerProfileId', options[:customer_profile_id])
+-        
++
+         xml.tag!('address') do
+           add_address(xml, options[:address])
+         end
+-        
++
+         xml.target!
+       end
+ 
+@@ -525,8 +525,8 @@ module ActiveMerchant #:nodoc:
+       end
+ 
+       def build_update_customer_profile_request(xml, options)
+-        add_profile(xml, options[:profile], true) 
+-        
++        add_profile(xml, options[:profile], true)
++
+         xml.target!
+       end
+ 
+@@ -534,7 +534,7 @@ module ActiveMerchant #:nodoc:
+         xml.tag!('customerProfileId', options[:customer_profile_id])
+ 
+         xml.tag!('paymentProfile') do
+-          add_payment_profile(xml, options[:payment_profile]) 
++          add_payment_profile(xml, options[:payment_profile])
+         end
+ 
+         xml.target!
+@@ -544,7 +544,7 @@ module ActiveMerchant #:nodoc:
+         xml.tag!('customerProfileId', options[:customer_profile_id])
+ 
+         xml.tag!('address') do
+-          add_address(xml, options[:address]) 
++          add_address(xml, options[:address])
+         end
+ 
+         xml.target!
+@@ -553,10 +553,10 @@ module ActiveMerchant #:nodoc:
+       def build_create_customer_profile_transaction_request(xml, options)
+         add_transaction(xml, options[:transaction])
+         xml.tag!('extraOptions', "x_test_request=TRUE") if @options[:test]
+-        
++
+         xml.target!
+       end
+-      
++
+       def build_validate_customer_payment_profile_request(xml, options)
+         xml.tag!('customerProfileId', options[:customer_profile_id])
+         xml.tag!('customerPaymentProfileId', options[:customer_payment_profile_id])
+@@ -587,12 +587,12 @@ module ActiveMerchant #:nodoc:
+           end
+         end
+       end
+-      
++
+       def add_transaction(xml, transaction)
+         unless CIM_TRANSACTION_TYPES.include?(transaction[:type])
+           raise StandardError, "Invalid Customer Information Manager Transaction Type: #{transaction[:type]}"
+         end
+-        
++
+         xml.tag!('transaction') do
+           xml.tag!(CIM_TRANSACTION_TYPES[transaction[:type]]) do
+             # The amount to be billed to the customer
+@@ -625,7 +625,7 @@ module ActiveMerchant #:nodoc:
+           end
+         end
+       end
+-      
++
+       def add_order(xml, order)
+         xml.tag!('order') do
+           xml.tag!('invoiceNumber', order[:invoice_number]) if order[:invoice_number]
+@@ -633,7 +633,7 @@ module ActiveMerchant #:nodoc:
+           xml.tag!('purchaseOrderNumber', order[:purchase_order_number]) if order[:purchase_order_number]
+         end
+       end
+-      
++
+       def add_payment_profiles(xml, payment_profiles)
+         xml.tag!('paymentProfiles') do
+           add_payment_profile(xml, payment_profiles)
+@@ -652,7 +652,7 @@ module ActiveMerchant #:nodoc:
+             add_address(xml, payment_profile[:bill_to])
+           end
+         end
+-        
++
+         if payment_profile[:payment]
+           xml.tag!('payment') do
+             add_credit_card(xml, payment_profile[:payment][:credit_card]) if payment_profile[:payment].has_key?(:credit_card)
+@@ -663,7 +663,7 @@ module ActiveMerchant #:nodoc:
+             xml.tag!('taxId', payment_profile[:payment]) if payment_profile[:payment].has_key?(:tax_id)
+           end
+         end
+-        
++
+         xml.tag!('customerPaymentProfileId', payment_profile[:customer_payment_profile_id]) if payment_profile[:customer_payment_profile_id]
+       end
+ 
+@@ -685,7 +685,7 @@ module ActiveMerchant #:nodoc:
+         xml.tag!('country', address[:country])
+         xml.tag!('phoneNumber', address[:phone_number]) if address[:phone_number]
+         xml.tag!('faxNumber', address[:fax_number]) if address[:fax_number]
+-        
++
+         xml.tag!('customerAddressId', address[:customer_address_id]) if address[:customer_address_id]
+       end
+ 
+@@ -702,14 +702,14 @@ module ActiveMerchant #:nodoc:
+           xml.tag!('cardCode', credit_card.verification_value) if credit_card.verification_value?
+         end
+       end
+-      
++
+       # Adds customer’s bank account information
+-      # Note: This element should only be included 
++      # Note: This element should only be included
+       # when the payment method is bank account.
+       def add_bank_account(xml, bank_account)
+         raise StandardError, "Invalid Bank Account Type: #{bank_account[:account_type]}" unless BANK_ACCOUNT_TYPES.include?(bank_account[:account_type])
+         raise StandardError, "Invalid eCheck Type: #{bank_account[:echeck_type]}" unless ECHECK_TYPES.include?(bank_account[:echeck_type])
+-        
++
+         xml.tag!('bankAccount') do
+           # The type of bank account
+           xml.tag!('accountType', BANK_ACCOUNT_TYPES[bank_account[:account_type]])
+@@ -717,19 +717,19 @@ module ActiveMerchant #:nodoc:
+           xml.tag!('routingNumber', bank_account[:routing_number])
+           # The bank account number
+           xml.tag!('accountNumber', bank_account[:account_number])
+-          # The full name of the individual associated 
++          # The full name of the individual associated
+           # with the bank account number
+           xml.tag!('nameOnAccount', bank_account[:name_on_account])
+           # The type of electronic check transaction
+           xml.tag!('echeckType', ECHECK_TYPES[bank_account[:echeck_type]])
+-          # The full name of the individual associated 
++          # The full name of the individual associated
+           # with the bank account number (optional)
+           xml.tag!('bankName', bank_account[:bank_name]) if bank_account[:bank_name]
+         end
+       end
+-      
++
+       # Adds customer’s driver's license information
+-      # Note: This element is only required for 
++      # Note: This element is only required for
+       # Wells Fargo SecureSource eCheck.Net merchants
+       def add_drivers_license(xml, drivers_license)
+         xml.tag!('driversLicense') do
+@@ -743,11 +743,11 @@ module ActiveMerchant #:nodoc:
+           xml.tag!('dateOfBirth', drivers_license[:date_of_birth])
+         end
+       end
+-      
++
+       def commit(action, request)
+         url = test? ? test_url : live_url
+         xml = ssl_post(url, request, "Content-Type" => "text/xml")
+-        
++
+         response_params = parse(action, xml)
+ 
+         message = response_params['messages']['message']['text']
+@@ -758,7 +758,7 @@ module ActiveMerchant #:nodoc:
+           :test => test_mode,
+           :authorization => response_params['customer_profile_id'] || (response_params['profile'] ? response_params['profile']['customer_profile_id'] : nil)
+         )
+-        
++
+         response.params['direct_response'] = parse_direct_response(response) if response.params['direct_response']
+         response
+       end
+@@ -816,7 +816,7 @@ module ActiveMerchant #:nodoc:
+           }
+         )
+       end
+-      
++
+       def parse(action, xml)
+         xml = REXML::Document.new(xml)
+         root = REXML::XPath.first(xml, "//#{CIM_ACTIONS[action]}Response") ||
+@@ -841,8 +841,8 @@ module ActiveMerchant #:nodoc:
+                 response[key] = [response[key], value]
+               end
+             else
+-              response[key] = parse_element(e) 
+-            end 
++              response[key] = parse_element(e)
++            end
+           }
+         else
+           response = node.text
+diff --git a/test/remote/gateways/remote_authorize_net_cim_test.rb b/test/remote/gateways/remote_authorize_net_cim_test.rb
+index eb7eb52..610503a 100644
+--- a/test/remote/gateways/remote_authorize_net_cim_test.rb
++++ b/test/remote/gateways/remote_authorize_net_cim_test.rb
+@@ -11,7 +11,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     @payment = {
+       :credit_card => @credit_card
+     }
+-    @profile = { 
++    @profile = {
+       :merchant_customer_id => 'Up to 20 chars', # Optional
+       :description => 'Up to 255 Characters', # Optional
+       :email => 'Up to 255 Characters', # Optional
+@@ -21,8 +21,8 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+         :payment => @payment
+       },
+       :ship_to_list => {
+-        :first_name => 'John', 
+-        :last_name => 'Doe', 
++        :first_name => 'John',
++        :last_name => 'Doe',
+         :company => 'Widgets, Inc',
+         :address1 => '1234 Fake Street',
+         :city => 'Anytown',
+@@ -158,7 +158,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_equal response.params['direct_response']['order_description'], 'Test Order Description'
+     assert_equal response.params['direct_response']['purchase_order_number'], '4321'
+   end
+-  
++
+   def test_successful_create_customer_payment_profile_request
+     payment_profile = @options[:profile].delete(:payment_profiles)
+     assert response = @gateway.create_customer_profile(@options)
+@@ -261,7 +261,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_nil response.authorization
+     assert customer_payment_profile_id = response.params['customer_payment_profile_id']
+     assert customer_payment_profile_id =~ /\d+/, "The customerPaymentProfileId should be numeric. It was #{customer_payment_profile_id}"
+-    
++
+     assert response = @gateway.get_customer_profile(:customer_profile_id => @customer_profile_id)
+     assert_equal 2, response.params['profile']['payment_profiles'].size
+     assert_equal 'XXXX4242', response.params['profile']['payment_profiles'][0]['payment']['credit_card']['card_number']
+@@ -390,7 +390,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     # Show that fields that were left out of the update were cleared
+     assert_nil response.params['payment_profile']['customer_type']
+   end
+-  
++
+   def test_successful_update_customer_shipping_address_request
+     # Create a new Customer Profile with Shipping Address
+     assert response = @gateway.create_customer_profile(@options)
+@@ -457,10 +457,10 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_nil response.authorization
+     assert_equal "This transaction has been approved.", response.params['direct_response']['message']
+   end
+-  
++
+   def test_should_create_customer_profile_transaction_auth_capture_and_then_void_request
+     response = get_and_validate_auth_capture_response
+-    
++
+     assert response = @gateway.create_customer_profile_transaction_for_void(
+       :transaction => {
+         :type => :void,
+@@ -591,10 +591,10 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+   def get_and_validate_auth_capture_response
+     assert response = @gateway.create_customer_profile(@options)
+     @customer_profile_id = response.authorization
+-  
++
+     assert response = @gateway.get_customer_profile(:customer_profile_id => @customer_profile_id)
+     @customer_payment_profile_id = response.params['profile']['payment_profiles']['customer_payment_profile_id']
+-  
++
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+         :customer_profile_id => @customer_profile_id,
+@@ -608,7 +608,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+         :amount => @amount
+       }
+     )
+-  
++
+     assert response.test?
+     assert_success response
+     assert_nil response.authorization
+@@ -621,5 +621,5 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_equal response.params['direct_response']['purchase_order_number'], '4321'
+     return response
+   end
+-  
++
+ end
+\ No newline at end of file
+diff --git a/test/unit/gateways/authorize_net_cim_test.rb b/test/unit/gateways/authorize_net_cim_test.rb
+index 69ec147..202b94c 100644
+--- a/test/unit/gateways/authorize_net_cim_test.rb
++++ b/test/unit/gateways/authorize_net_cim_test.rb
+@@ -15,7 +15,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     @payment = {
+       :credit_card => @credit_card
+     }
+-    @profile = { 
++    @profile = {
+       :merchant_customer_id => 'Up to 20 chars', # Optional
+       :description => 'Up to 255 Characters', # Optional
+       :email => 'Up to 255 Characters', # Optional
+@@ -25,8 +25,8 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+         :payment => @payment
+       },
+       :ship_to_list => {
+-        :first_name => 'John', 
+-        :last_name => 'Doe', 
++        :first_name => 'John',
++        :last_name => 'Doe',
+         :company => 'Widgets, Inc',
+         :address1 => '1234 Fake Street',
+         :city => 'Anytown',
+@@ -42,12 +42,12 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+       :profile => @profile
+     }
+   end
+-  
++
+   def test_expdate_formatting
+     assert_equal '2009-09', @gateway.send(:expdate, credit_card('4111111111111111', :month => "9", :year => "2009"))
+     assert_equal '2013-11', @gateway.send(:expdate, credit_card('4111111111111111', :month => "11", :year => "2013"))
+   end
+-  
++
+   def test_should_create_customer_profile_request
+     @gateway.expects(:ssl_post).returns(successful_create_customer_profile_response)
+ 
+@@ -82,8 +82,8 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert response = @gateway.create_customer_shipping_address(
+       :customer_profile_id => @customer_profile_id,
+       :address => {
+-        :first_name => 'John', 
+-        :last_name => 'Doe', 
++        :first_name => 'John',
++        :last_name => 'Doe',
+         :company => 'Widgets, Inc',
+         :address1 => '1234 Fake Street',
+         :city => 'Anytown',
+@@ -104,9 +104,9 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+-        :customer_profile_id => @customer_profile_id, 
+-        :customer_payment_profile_id => @customer_payment_profile_id, 
+-        :type => :auth_only, 
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :type => :auth_only,
+         :amount => @amount
+       }
+     )
+@@ -312,7 +312,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def test_should_validate_customer_payment_profile_request
+     @gateway.expects(:ssl_post).returns(successful_validate_customer_payment_profile_response)
+-  
++
+     assert response = @gateway.validate_customer_payment_profile(
+       :customer_profile_id => @customer_profile_id,
+       :customer_payment_profile_id => @customer_payment_profile_id,
+@@ -357,7 +357,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def test_should_create_customer_profile_transaction_auth_capture_and_then_void_request
+     response = get_and_validate_auth_capture_response
+-    
++
+     @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+@@ -374,7 +374,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_profile_ids_request
+     response = get_and_validate_auth_capture_response
+-    
++
+     @gateway.expects(:ssl_post).returns(unsuccessful_create_customer_profile_transaction_response(:refund))
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+@@ -396,13 +396,13 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_masked_credit_card_request
+     response = get_and_validate_auth_capture_response
+-    
++
+     @gateway.expects(:ssl_post).returns(unsuccessful_create_customer_profile_transaction_response(:refund))
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+         :type => :refund,
+         :amount => 1,
+-        
++
+         :customer_profile_id => @customer_profile_id,
+         :customer_payment_profile_id => @customer_payment_profile_id,
+         :trans_id => response.params['direct_response']['transaction_id']
+@@ -420,7 +420,7 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+   # TODO - implement this
+   # def test_should_create_customer_profile_transaction_auth_capture_and_then_refund_using_masked_electronic_checking_info_request
+   #   response = get_and_validate_auth_capture_response
+-  #   
++  #
+   #   @gateway.expects(:ssl_post).returns(successful_create_customer_profile_transaction_response(:void))
+   #   assert response = @gateway.create_customer_profile_transaction(
+   #     :transaction => {
+@@ -472,9 +472,9 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+     assert response = @gateway.create_customer_profile_transaction(
+       :transaction => {
+-        :customer_profile_id => @customer_profile_id, 
+-        :customer_payment_profile_id => @customer_payment_profile_id, 
+-        :type => :auth_only, 
++        :customer_profile_id => @customer_profile_id,
++        :customer_payment_profile_id => @customer_payment_profile_id,
++        :type => :auth_only,
+         :amount => @amount
+       }
+     )
+@@ -509,42 +509,42 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+     assert_equal 'This transaction has been approved.', response.params['direct_response']['message']
+     return response
+   end
+-  
++
+   def successful_create_customer_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <createCustomerProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
+-        <customerProfileId>#{@customer_profile_id}</customerProfileId> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <createCustomerProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
++        <customerProfileId>#{@customer_profile_id}</customerProfileId>
+       </createCustomerProfileResponse>
+     XML
+   end
+ 
+   def successful_create_customer_payment_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <createCustomerPaymentProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <createCustomerPaymentProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
+         <messages>
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <customerPaymentProfileId>#{@customer_payment_profile_id}</customerPaymentProfileId>
+         <validationDirectResponse>This output is only present if the ValidationMode input parameter is passed with a value of testMode or liveMode</validationDirectResponse>
+       </createCustomerPaymentProfileResponse>
+@@ -553,19 +553,19 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_create_customer_shipping_address_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <createCustomerShippingAddressResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <createCustomerShippingAddressResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
+         <messages>
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <customerAddressId>customerAddressId</customerAddressId>
+       </createCustomerShippingAddressResponse>
+     XML
+@@ -573,77 +573,77 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_delete_customer_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <deleteCustomerProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
+-        <customerProfileId>#{@customer_profile_id}</customerProfileId> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <deleteCustomerProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
++        <customerProfileId>#{@customer_profile_id}</customerProfileId>
+       </deleteCustomerProfileResponse>
+     XML
+   end
+ 
+   def successful_delete_customer_payment_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <deleteCustomerPaymentProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <deleteCustomerPaymentProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+       </deleteCustomerPaymentProfileResponse>
+     XML
+   end
+ 
+   def successful_delete_customer_shipping_address_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <deleteCustomerShippingAddressResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <deleteCustomerShippingAddressResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+       </deleteCustomerShippingAddressResponse>
+     XML
+   end
+ 
+   def successful_get_customer_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <getCustomerProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <getCustomerProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <customerProfileId>#{@customer_profile_id}</customerProfileId>
+         <profile>
+           <paymentProfiles>
+@@ -702,19 +702,19 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_get_customer_payment_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <getCustomerPaymentProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <getCustomerPaymentProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <profile>
+           <paymentProfiles>
+             <customerPaymentProfileId>#{@customer_payment_profile_id}</customerPaymentProfileId>
+@@ -732,19 +732,19 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_get_customer_shipping_address_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <getCustomerShippingAddressResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <getCustomerShippingAddressResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <address>
+           <customerAddressId>#{@customer_address_id}</customerAddressId>
+         </address>
+@@ -754,58 +754,58 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_update_customer_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <updateCustomerProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
+-        <customerProfileId>#{@customer_profile_id}</customerProfileId> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <updateCustomerProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
++        <customerProfileId>#{@customer_profile_id}</customerProfileId>
+       </updateCustomerProfileResponse>
+     XML
+   end
+ 
+   def successful_update_customer_payment_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <updateCustomerPaymentProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <updateCustomerPaymentProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+       </updateCustomerPaymentProfileResponse>
+     XML
+   end
+ 
+   def successful_update_customer_shipping_address_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <updateCustomerShippingAddressResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <updateCustomerShippingAddressResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+       </updateCustomerShippingAddressResponse>
+     XML
+   end
+@@ -824,39 +824,39 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+ 
+   def successful_create_customer_profile_transaction_response(transaction_type)
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <createCustomerProfileTransactionResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <createCustomerProfileTransactionResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <directResponse>#{SUCCESSFUL_DIRECT_RESPONSE[transaction_type]}</directResponse>
+       </createCustomerProfileTransactionResponse>
+     XML
+   end
+-  
++
+   def successful_validate_customer_payment_profile_response
+     <<-XML
+-      <?xml version="1.0" encoding="utf-8" ?> 
+-      <validateCustomerPaymentProfileResponse 
+-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+-        xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+-        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"> 
+-        <refId>refid1</refId> 
+-        <messages> 
+-          <resultCode>Ok</resultCode> 
+-          <message> 
+-            <code>I00001</code> 
+-            <text>Successful.</text> 
+-          </message> 
+-        </messages> 
++      <?xml version="1.0" encoding="utf-8" ?>
++      <validateCustomerPaymentProfileResponse
++        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++        xmlns:xsd="http://www.w3.org/2001/XMLSchema"
++        xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd">
++        <refId>refid1</refId>
++        <messages>
++          <resultCode>Ok</resultCode>
++          <message>
++            <code>I00001</code>
++            <text>Successful.</text>
++          </message>
++        </messages>
+         <directResponse>1,1,1,This transaction has been approved.,DEsVh8,Y,508276300,none,Test transaction for ValidateCustomerPaymentProfile.,0.01,CC,auth_only,Up to 20 chars,,,,,,,,,,,Up to 255 Characters,John,Doe,Widgets, Inc,1234 Fake Street,Anytown,MD,12345,USA,0.0000,0.0000,0.0000,TRUE,none,7EB3A44624C0C10FAAE47E276B48BF17,,2,,,,,,,,,,,,,,,,,,,,,,,,,,,,</directResponse>
+       </validateCustomerPaymentProfileResponse>
+     XML
+@@ -880,5 +880,5 @@ class AuthorizeNetCimTest < Test::Unit::TestCase
+       </createCustomerProfileTransactionResponse>
+     XML
+   end
+-  
++
+ end
+-- 
+1.6.0.4
+
